@@ -28,6 +28,7 @@
 
 #include "wasm.h"
 #include "pass.h"
+#include "asm_v_wasm.h"
 #include "wasm-builder.h"
 #include "ir/function-type-utils.h"
 #include "ir/literal-utils.h"
@@ -35,7 +36,6 @@
 
 namespace wasm {
 
-Name TEMP_RET_0("tempRet0");
 Name GET_TEMP_RET_0("getTempRet0");
 Name SET_TEMP_RET_0("setTempRet0");
 
@@ -103,17 +103,11 @@ struct LegalizeJSInterface : public Pass {
       passRunner.add<FixImports>(&illegalImportsToLegal);
       passRunner.run();
     }
-
-    if (needTempRet0Helpers) {
-      addTempRet0Helpers(module);
-    }
   }
 
 private:
   // map of illegal to legal names for imports
   std::map<Name, Name> illegalImportsToLegal;
-
-  bool needTempRet0Helpers = false;
 
   template<typename T>
   bool isIllegal(T* t) {
@@ -123,6 +117,7 @@ private:
     if (t->result == i64 || t->result == f32) return true;
     return false;
   }
+
 
   // JS calls the export, so it must call a legal stub that calls the actual wasm function
   Name makeLegalStub(Function* func, Module* module) {
@@ -149,15 +144,12 @@ private:
     }
 
     if (func->result == i64) {
+      ensureFunction(module, SET_TEMP_RET_0, "vi");
       legal->result = i32;
       auto index = builder.addVar(legal, Name(), i64);
       auto* block = builder.makeBlock();
       block->list.push_back(builder.makeSetLocal(index, call));
-      ensureTempRet0(module);
-      block->list.push_back(builder.makeSetGlobal(
-        TEMP_RET_0,
-        I64Utilities::getI64High(builder, index)
-      ));
+      block->list.push_back(builder.makeCall(SET_TEMP_RET_0, {I64Utilities::getI64High(builder, index)}, none));
       block->list.push_back(I64Utilities::getI64Low(builder, index));
       block->finalize();
       legal->body = block;
@@ -211,10 +203,9 @@ private:
     }
 
     if (imFunctionType->result == i64) {
+      ensureFunction(module, GET_TEMP_RET_0, "i");
       call->type = i32;
-      Expression* get;
-      ensureTempRet0(module);
-      get = builder.makeGetGlobal(TEMP_RET_0, i32);
+      Expression* get = builder.makeCall(GET_TEMP_RET_0, {}, call->type);
       func->body = I64Utilities::recreateI64(builder, call, get);
       type->result = i32;
     } else if (imFunctionType->result == f32) {
@@ -241,52 +232,21 @@ private:
     return func->name;
   }
 
-  void ensureTempRet0(Module* module) {
-    if (!module->getGlobalOrNull(TEMP_RET_0)) {
-      module->addGlobal(Builder::makeGlobal(
-        TEMP_RET_0,
-        i32,
-        LiteralUtils::makeZero(i32, *module),
-        Builder::Mutable
-      ));
-      needTempRet0Helpers = true;
+  static void ensureFunction(Module* module, Name name, std::string sig) {
+    if (module->getFunctionOrNull(name)) {
+      return;
     }
-  }
-
-  void addTempRet0Helpers(Module* module) {
-    // We should also let JS access the tempRet0 global, which
-    // is necessary to send/receive 64-bit return values.
-    auto exportIt = [&](Function* func) {
-      auto* export_ = new Export;
-      export_->name = func->name;
-      export_->value = func->name;
-      export_->kind = ExternalKind::Function;
-      module->addExport(export_);
-    };
-    if (!module->getExportOrNull(GET_TEMP_RET_0)) {
-      Builder builder(*module);
-      auto* func = new Function();
-      func->name = GET_TEMP_RET_0;
-      func->result = i32;
-      func->body = builder.makeGetGlobal(TEMP_RET_0, i32);
-      module->addFunction(func);
-      exportIt(func);
-    }
-    if (!module->getExportOrNull(SET_TEMP_RET_0)) {
-      Builder builder(*module);
-      auto* func = new Function();
-      func->name = SET_TEMP_RET_0;
-      func->result = none;
-      func->params.push_back(i32);
-      func->body = builder.makeSetGlobal(
-        TEMP_RET_0,
-        builder.makeGetLocal(0, i32)
-      );
-      module->addFunction(func);
-      exportIt(func);
-    }
+    auto import = new Function;
+    import->name = name;
+    import->module = "env";
+    import->base = name;
+    auto* functionType = ensureFunctionType(sig, module);
+    import->type = functionType->name;
+    FunctionTypeUtils::fillFunction(import, functionType);
+    module->addFunction(import);
   }
 };
+
 
 Pass *createLegalizeJSInterfacePass() {
   return new LegalizeJSInterface();
